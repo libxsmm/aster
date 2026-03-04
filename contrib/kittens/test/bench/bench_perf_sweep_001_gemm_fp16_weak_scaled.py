@@ -412,11 +412,23 @@ def _run_single(args):
     print(f"  iterations={args.iterations}, warmup={WARMUP_ITERATIONS}")
     sys.stdout.flush()
 
+    if args.compile_only:
+        if not args.hsaco:
+            print("Error: --compile-only requires --hsaco <output_path>")
+            raise SystemExit(1)
+        compile_weak_scaled_gemm(cfg, args.hsaco)
+        print(f"  Compiled: {args.hsaco}")
+        return
+
     A, B = _make_inputs(cfg)
 
     if args.hsaco:
-        # Execute pre-compiled HSACO (used by sweep phase 2).
-        _, times_ns = execute_weak_scaled_hsaco(cfg, args.hsaco, args.iterations, A, B)
+        # Execute pre-compiled HSACO (used by sweep phase 2 / rocprofv3).
+        # Skip GPU check: if caller provided an HSACO they know the GPU is there,
+        # and rocminfo hangs under rocprofv3.
+        _, times_ns = execute_weak_scaled_hsaco(
+            cfg, args.hsaco, args.iterations, A, B, skip_gpu_check=True
+        )
     else:
         # Full compile + execute (used for standalone repro).
         import tempfile as _tempfile
@@ -482,5 +494,10 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to pre-compiled HSACO (skips compilation)",
+    )
+    parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        help="Compile HSACO and exit (requires --hsaco for output path)",
     )
     _run_single(parser.parse_args())

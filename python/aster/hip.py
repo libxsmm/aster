@@ -31,19 +31,41 @@ from typing import List, Optional, Tuple
 def system_has_gpu(mcpu: str) -> bool:
     """Check if a GPU matching mcpu is available via rocminfo.
 
-    Does NOT import aster/MLIR/LLVM.
+    Does NOT import aster/MLIR/LLVM. This is the single canonical
+    implementation -- aster.utils.system_has_mcpu delegates here.
     """
+    base_mcpu = mcpu.split(":")[0]
+    import shutil
+
+    rocminfo_path = shutil.which("rocminfo")
     try:
         result = subprocess.run(
-            ["rocminfo"], capture_output=True, text=True, timeout=10
+            ["rocminfo"], capture_output=True, text=True, timeout=30
         )
-        archs = set(
-            a.split(":")[0]
-            for a in re.findall(r"gfx[0-9]{3,4}[a-z0-9]*", result.stdout)
+    except FileNotFoundError:
+        print(
+            "WARNING: rocminfo not found on PATH. "
+            "Install ROCm or add its bin/ directory to PATH."
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        archs = set()
-    return mcpu in archs
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"WARNING: rocminfo timed out after 30s (path: {rocminfo_path}).")
+        return False
+
+    if result.returncode != 0:
+        print(f"WARNING: rocminfo exited with code {result.returncode}.")
+        return False
+
+    raw_matches = re.findall(r"gfx[0-9]{3,4}[a-z0-9]*", result.stdout)
+    archs = set(a.split(":")[0] for a in raw_matches)
+    found = base_mcpu in archs
+    if not found:
+        print(
+            f"DEBUG system_has_gpu: looking for '{base_mcpu}', "
+            f"rocminfo found archs={sorted(archs)}, "
+            f"raw_matches={raw_matches}"
+        )
+    return found
 
 
 def _capsule(ptr):
