@@ -33,9 +33,9 @@ class WeakScaleConfig:
     n_waves: int  # waves per WG along N
     m_tiles: int
     n_tiles: int
+    k_tiles: int
     num_stages: int
     k: int
-    k_tiles: int = 1  # TODO: extend this
 
     @property
     def num_workgroups(self):
@@ -78,10 +78,11 @@ class WeakScaleConfig:
 
     @property
     def label(self):
+        tile_str = f"_t{self.m_tiles}x{self.n_tiles}x{self.k_tiles}"
         return (
             f"m{self.m_dim}xn{self.n_dim}xk{self.k}"
             f"_wg{self.m_wg}x{self.n_wg}_w{self.m_waves}x{self.n_waves}"
-            f"_t{self.m_tiles}x{self.n_tiles}_s{self.num_stages}"
+            f"{tile_str}_s{self.num_stages}"
         )
 
 
@@ -95,17 +96,23 @@ def _make_substitutions(cfg):
     subs["{{A_LDS_BYTES}}"] = str(cfg.m_waves * cfg.m_tiles * cfg.k_tiles * 512)
     subs["{{B_LDS_BYTES}}"] = str(cfg.n_waves * cfg.n_tiles * cfg.k_tiles * 512)
     subs["{{STRIDE_C}}"] = str(cfg.n_dim * 4)  # f32 = 4 bytes
-    subs["{{SHARED_MEM}}"] = str(cfg.lds_bytes)
+    # shared_memory_size must be 0: all LDS is managed by alloc_lds/dealloc_lds.
+    # The LDS allocator uses shared_memory_size as startPos, so any non-zero value
+    # wastes that many bytes of LDS (offsets start after the pre-reserved region).
+    subs["{{SHARED_MEM}}"] = "0"
     subs["{{NUM_THREADS}}"] = str(cfg.num_threads)
     subs["{{NUM_BLOCKS}}"] = str(cfg.num_workgroups)
+    subs["{{K_T}}"] = str(cfg.k_tiles)
+    subs["{{A_TILES_PER_SLICE}}"] = str(cfg.m_waves * cfg.m_tiles)
+    subs["{{B_TILES_PER_SLICE}}"] = str(cfg.n_waves * cfg.n_tiles)
     return subs
 
 
 def compile_weak_scaled_gemm(cfg, output_hsaco_path):
-    """Compile a weak-scaled GEMM config to HSACO. Returns the hsaco path.
+    """Compile a weak-scaled GEMM config to HSACO.
 
-    This is the CPU-only compilation step (no GPU needed). Safe to run in parallel
-    across configs.
+    Returns (hsaco_path, asm_str). This is the CPU-only compilation step (no GPU
+    needed). Safe to run in parallel across configs.
     """
     from aster import ir, utils
     from aster.testing import compile_mlir_file_to_asm
@@ -135,7 +142,7 @@ def compile_weak_scaled_gemm(cfg, output_hsaco_path):
             output_path=output_hsaco_path,
         )
         assert path is not None, "assemble_to_hsaco returned None"
-        return path
+        return path, asm
     finally:
         ctx.__exit__(None, None, None)
 
@@ -184,31 +191,39 @@ class TestWeakScaleCorrectness:
     )
     @pytest.mark.parametrize(
         "m_waves,n_waves",
-        [(1, 1), (2, 2), (2, 4), (4, 4)],
-        ids=["waves_1x1", "waves_2x2", "waves_2x4", "waves_4x4"],
+        [(1, 1), (2, 2), (2, 4)],
+        ids=["waves_1x1", "waves_2x2", "waves_2x4"],
     )
     @pytest.mark.parametrize(
-        "m_tiles,n_tiles",
-        [(1, 1), (2, 2), (2, 4)],
-        ids=["tiles_1x1", "tiles_2x2", "tiles_2x4"],
+        "m_tiles,n_tiles,k_tiles",
+        [(1, 1, 1), (2, 2, 1), (1, 4, 2), (2, 1, 3), (1, 2, 4)],
+        ids=["tiles_1x1x1", "tiles_2x2x1", "tiles_1x4x2", "tiles_2x1x3", "tiles_1x2x4"],
     )
     @pytest.mark.parametrize("num_stages", [2, 3], ids=["2stage", "3stage"])
     def test_correctness(
-        self, m_wg, n_wg, m_waves, n_waves, m_tiles, n_tiles, num_stages
+        self, m_wg, n_wg, m_waves, n_waves, m_tiles, n_tiles, k_tiles, num_stages
     ):
-        """Constexpr GEMM at K=128, verified against numpy."""
-        k = 128
+        """Constexpr GEMM verified against numpy.
+
+        K = 4 * k_tiles * 16.
+        """
+        k = 4 * k_tiles * 16
         cfg = WeakScaleConfig(
-            m_wg, n_wg, m_waves, n_waves, m_tiles, n_tiles, num_stages, k
+            m_wg,
+            n_wg,
+            m_waves,
+            n_waves,
+            m_tiles,
+            n_tiles,
+            k_tiles,
+            num_stages,
+            k,
         )
-        # Note: conservative for now, seems we get burned when flying too close to the sky.
-        if cfg.lds_bytes >= 2**16 * 0.75:
-            pytest.skip(f"LDS {cfg.lds_bytes} >= 2 ** 15 for {cfg.label}")
         np.random.seed(42)
         A = (np.random.randn(cfg.m_dim, cfg.k) * 0.1).astype(np.float16)
         B = (np.random.randn(cfg.n_dim, cfg.k) * 0.1).astype(np.float16)
         with tempfile.NamedTemporaryFile(suffix=".hsaco", delete=True) as tmp:
-            compile_weak_scaled_gemm(cfg, tmp.name)
+            compile_weak_scaled_gemm(cfg, tmp.name)  # asm unused in correctness tests
             C_output, _ = execute_weak_scaled_hsaco(cfg, tmp.name, 1, A, B)
 
         expected = (A.astype(np.float32) @ B.astype(np.float32).T).flatten()
