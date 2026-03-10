@@ -289,4 +289,113 @@ def NoRegCastOpsAttr : AMDGCN_Attr<
   }];
 }
 
+def NoCfBranchesAttr : AMDGCN_Attr<
+    "NoCfBranches", "no_cf_branches",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no CF dialect branch operations";
+  let description = [{
+    Verifies that no `cf.br` or `cf.cond_br` operations exist in the IR.
+    This is the post-condition of the `amdgcn-legalize-cf` pass, which
+    lowers CF dialect branches to AMDGCN scalar branch instructions
+    (`s_branch`, `s_cbranch_scc0/1`).
+  }];
+}
+
+def NoScfOpsAttr : AMDGCN_Attr<
+    "NoScfOps", "no_scf_ops",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no SCF dialect operations";
+  let description = [{
+    Verifies that no SCF dialect operations (`scf.for`, `scf.if`, `scf.while`,
+    etc.) exist in the IR. This is the post-condition of the
+    `amdgcn-convert-scf-control-flow` pass, which lowers SCF structured
+    control flow to CF dialect branches and AMDGCN compare instructions.
+  }];
+}
+
+def NoLsirOpsAttr : AMDGCN_Attr<
+    "NoLsirOps", "no_lsir_ops",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no LSIR dialect operations";
+  let description = [{
+    Verifies that no LSIR dialect operations exist in the IR.
+    This is the combined form of `no_lsir_compute_ops` and
+    `no_lsir_control_ops`. Set at the end of the `amdgcn-backend` pipeline
+    after `LegalizeCF` has lowered the last surviving LSIR ops.
+  }];
+}
+
+def NoLsirComputeOpsAttr : AMDGCN_Attr<
+    "NoLsirComputeOps", "no_lsir_compute_ops",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no LSIR compute/memory operations";
+  let description = [{
+    Verifies that no LSIR arithmetic, memory, or utility operations exist in
+    the IR. This includes all LSIR ops except the control-flow-related ops
+    (`lsir.cmpi`, `lsir.cmpf`, `lsir.select`) and the regalloc primitive
+    (`lsir.copy`).
+
+    Set at the entry of the `amdgcn-backend` pipeline, after `aster-to-amdgcn`
+    and canonicalize/CSE have eliminated all compute LSIR ops.
+
+    Allowed ops (not checked by this form):
+    - `lsir.cmpi`, `lsir.cmpf`, `lsir.select` -- lowered by `LegalizeCF`
+    - `lsir.copy` -- created by bufferization, consumed by register coloring
+  }];
+}
+
+def NoLsirControlOpsAttr : AMDGCN_Attr<
+    "NoLsirControlOps", "no_lsir_control_ops",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no LSIR control-flow operations";
+  let description = [{
+    Verifies that no LSIR control-flow-related operations (`lsir.cmpi`,
+    `lsir.cmpf`, `lsir.select`) exist in the IR.
+
+    These ops survive through `aster-to-amdgcn` because they operate on i1
+    conditions and SCC flags, which are only lowered by `amdgcn-legalize-cf`
+    after register allocation.
+
+    Set after `LegalizeCF` in the `amdgcn-backend` pipeline.
+  }];
+}
+
+def NoRegisterBlockArgsAttr : AMDGCN_Attr<
+    "NoRegisterBlockArgs", "no_register_block_args",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no block arguments with register types";
+  let description = [{
+    Verifies that no block arguments have register types
+    (`RegisterTypeInterface`). This is the post-condition of the
+    `aster-amdgcn-bufferization` pass, which replaces register-typed
+    phi-nodes with alloca + copy pairs.
+  }];
+}
+
+def NoAffineOpsAttr : AMDGCN_Attr<
+    "NoAffineOps", "no_affine_ops",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no affine dialect operations";
+  let description = [{
+    Verifies that no affine dialect operations (`affine.apply`, `affine.for`,
+    etc.) exist in the IR. This is the post-condition of the
+    `aster-to-int-arith` pass, which lowers affine operations to standard
+    arith operations and converts index types to integer types.
+  }];
+}
+
+def NoMetadataOpsAttr : AMDGCN_Attr<
+    "NoMetadataOps", "no_metadata_ops",
+    [DeclareAttrInterfaceMethods<NormalFormAttrInterface, ["verifyOperation"]>]> {
+  let summary = "Normal form: no AMDGCN metadata operations";
+  let description = [{
+    Verifies that no AMDGCN metadata operations remain in the IR.
+    This includes `amdgcn.load_arg`, `amdgcn.thread_id`, `amdgcn.block_dim`,
+    `amdgcn.block_id`, `amdgcn.grid_dim`, and `amdgcn.make_buffer_rsrc`.
+    This is the post-condition of the `aster-amdgcn-expand-md-ops` pass,
+    which expands these high-level metadata operations into concrete
+    hardware instructions.
+  }];
+}
+
 #endif // ASTER_AMDGCN_ATTRS_TD

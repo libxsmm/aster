@@ -14,6 +14,7 @@
 #include "aster/Dialect/AMDGCN/IR/Utils.h"
 #include "aster/Dialect/LSIR/IR/LSIROps.h"
 #include "aster/Interfaces/RegisterType.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -237,5 +238,134 @@ NoRegCastOpsAttr::verifyOperation(function_ref<InFlightDiagnostic()> emitError,
                           "survive past aster-to-amdgcn; this indicates an "
                           "incorrect lsir.to_reg or lsir.from_reg surviving "
                           "from high-level (hand-authored ?) IR";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NoLsirOpsAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+NoLsirOpsAttr::verifyOperation(function_ref<InFlightDiagnostic()> emitError,
+                               Operation *op) const {
+  if (op->getDialect() && op->getDialect()->getNamespace() == "lsir")
+    return emitError() << "normal form violation: LSIR dialect operations "
+                          "are disallowed but found: "
+                       << op->getName();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NoLsirComputeOpsAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult NoLsirComputeOpsAttr::verifyOperation(
+    function_ref<InFlightDiagnostic()> emitError, Operation *op) const {
+  if (!op->getDialect() || op->getDialect()->getNamespace() != "lsir")
+    return success();
+
+  // Allow control-flow ops (lowered by LegalizeCF) and copy (regalloc
+  // primitive).
+  if (isa<lsir::CmpIOp, lsir::CmpFOp, lsir::SelectOp, lsir::CopyOp>(op))
+    return success();
+
+  return emitError() << "normal form violation: LSIR compute/memory "
+                        "operations are disallowed but found: "
+                     << op->getName();
+}
+
+//===----------------------------------------------------------------------===//
+// NoLsirControlOpsAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult NoLsirControlOpsAttr::verifyOperation(
+    function_ref<InFlightDiagnostic()> emitError, Operation *op) const {
+  if (isa<lsir::CmpIOp, lsir::CmpFOp, lsir::SelectOp>(op))
+    return emitError() << "normal form violation: LSIR control-flow "
+                          "operations are disallowed but found: "
+                       << op->getName();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NoScfOpsAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+NoScfOpsAttr::verifyOperation(function_ref<InFlightDiagnostic()> emitError,
+                              Operation *op) const {
+  if (op->getDialect() && op->getDialect()->getNamespace() == "scf")
+    return emitError() << "normal form violation: SCF dialect operations "
+                          "are disallowed but found: "
+                       << op->getName();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NoCfBranchesAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+NoCfBranchesAttr::verifyOperation(function_ref<InFlightDiagnostic()> emitError,
+                                  Operation *op) const {
+  if (isa<cf::BranchOp, cf::CondBranchOp>(op))
+    return emitError() << "normal form violation: cf.br/cf.cond_br operations "
+                          "are disallowed but found: "
+                       << op->getName();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NoRegisterBlockArgsAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult NoRegisterBlockArgsAttr::verifyOperation(
+    function_ref<InFlightDiagnostic()> emitError, Operation *op) const {
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region) {
+      for (BlockArgument arg : block.getArguments()) {
+        if (isa<RegisterTypeInterface>(arg.getType()))
+          return emitError()
+                 << "normal form violation: block arguments with register "
+                    "types are disallowed but found: "
+                 << arg.getType();
+      }
+    }
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NoAffineOpsAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+NoAffineOpsAttr::verifyOperation(function_ref<InFlightDiagnostic()> emitError,
+                                 Operation *op) const {
+  if (op->getDialect() && op->getDialect()->getNamespace() == "affine")
+    return emitError() << "normal form violation: affine dialect operations "
+                          "are disallowed but found: "
+                       << op->getName();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// NoMetadataOpsAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+NoMetadataOpsAttr::verifyOperation(function_ref<InFlightDiagnostic()> emitError,
+                                   Operation *op) const {
+  if (isa<LoadArgOp, ThreadIdOp, BlockDimOp, BlockIdOp, GridDimOp,
+          MakeBufferRsrcOp>(op))
+    return emitError() << "normal form violation: AMDGCN metadata operations "
+                          "are disallowed but found: "
+                       << op->getName();
+
   return success();
 }
