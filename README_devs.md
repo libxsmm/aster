@@ -68,6 +68,19 @@ git -C ${HOME}/llvm-project checkout ${LLVM_COMMIT}
 cd ${LLVM_BUILD} && ninja install
 ```
 
+If you need to modify LLVM and build test it:
+
+```bash
+export LLVM_BUILD=${HOME}/llvm-build
+export LLVM_VENV=${LLVM_BUILD}/.venv
+
+# build mlir-opt and runn all tests
+cd ${HOME}/llvm-build && ninja mlir-opt && ninja check-mlir
+
+# run single test
+${HOME}/llvm-build/bin/llvm-lit ~/llvm-project/mlir/test/Dialect/Affine/decompose-affine-ops-cse-friendly.mlir -v
+```
+
 ### LLVM target support
 
 ASTER has early .hsaco generation support for the following targets, which all
