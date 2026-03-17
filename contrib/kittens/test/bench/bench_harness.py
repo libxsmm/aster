@@ -20,8 +20,6 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 
 import numpy as np
 
-from kittens_helpers import LDS_SIZE
-
 # Parent directory contains the test modules and kittens_helpers.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Worktree root contains mlir_kernels (used by library preloading).
@@ -38,6 +36,49 @@ NUM_ITERATIONS = 5
 WARMUP_ITERATIONS = 2
 SUBPROCESS_TIMEOUT = 120  # seconds per execution
 DEFAULT_COMPILE_WORKERS = 8
+
+
+def check_numpy_blas(num_threads=None):
+    """Smoke-check that numpy BLAS is multithreaded.
+
+    Runs a 4096^2 x 4096 matmul and checks it completes in reasonable time. Assumes ~50
+    GFLOPS/thread/s for a well-configured BLAS. Prints a warning and returns False if
+    too slow.
+    """
+    import time
+
+    if num_threads is None:
+        num_threads = os.cpu_count() or 4
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(num_threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
+
+    N = 4096
+    flops = 2.0 * N * N * N
+    # 50 GFLOPS/thread/s is conservative for modern x86 with AVX2/AVX-512
+    expected_gflops = 50.0 * num_threads
+    max_ms = flops / (expected_gflops * 1e9) * 1000 * 3  # 3x margin
+
+    A = np.random.randn(N, N).astype(np.float32)
+    B = np.random.randn(N, N).astype(np.float32)
+    t0 = time.time()
+    _ = A @ B
+    elapsed_ms = (time.time() - t0) * 1000
+    actual_gflops = flops / (elapsed_ms * 1e6)
+
+    ok = elapsed_ms < max_ms
+    if not ok:
+        print(
+            f"WARNING: numpy BLAS is slow! 4k matmul: {elapsed_ms:.0f} ms "
+            f"({actual_gflops:.0f} GFLOPS), expected < {max_ms:.0f} ms "
+            f"({expected_gflops:.0f} GFLOPS with {num_threads} threads).\n"
+            f"  Check OPENBLAS_NUM_THREADS or install a fast BLAS (openblas, mkl)."
+        )
+    else:
+        print(
+            f"numpy BLAS ok: 4k matmul {elapsed_ms:.0f} ms "
+            f"({actual_gflops:.0f} GFLOPS, {num_threads} threads)"
+        )
+    return ok
 
 
 def detect_num_gpus():
@@ -93,12 +134,22 @@ def compile_one(cfg, hsaco_dir, compile_fn):
     Called in worker process. Returns (label, hsaco_path, KernelResources|None). Raises
     RuntimeError with actionable diagnostics on failure.
     """
-    from aster.hip import parse_asm_kernel_resources
+    from aster.hip import parse_asm_kernel_resources, compute_register_budget
 
     kname = cfg.kernel_name
     output_path = os.path.join(hsaco_dir, f"{cfg.label}.hsaco")
+
+    # Compute register budget from config's occupancy target.
+    num_wg_per_cu = getattr(cfg, "num_wg_per_cu", 1) or 1
+    mcpu = getattr(cfg, "mcpu", "gfx942")
+    budget_vgprs, budget_agprs, _lds = compute_register_budget(
+        cfg.num_threads, mcpu=mcpu, num_wg_per_cu=num_wg_per_cu
+    )
+
     try:
-        _, asm = compile_fn(cfg, output_path)
+        _, asm = compile_fn(
+            cfg, output_path, num_vgprs=budget_vgprs, num_agprs=budget_agprs
+        )
     except Exception as e:
         raise RuntimeError(format_mlir_error(e)) from None
     asm_path = output_path.replace(".hsaco", ".s")
@@ -168,13 +219,11 @@ def exec_one_config(
 def print_summary_table(
     results,
     failed,
-    skipped_broken,
-    skipped_lds,
     resources_map,
     repro_cmd_fn,
     num_iterations,
 ):
-    """Print sorted results table, repro commands, and failure summary."""
+    """Print sorted results table and save error repros to file."""
     if not results and not failed:
         print("\nNo configs were run.")
         return
@@ -196,50 +245,21 @@ def print_summary_table(
                 f"| {pct:>6.1f}% | {lds_kb:>4.0f}KB | {res_str}"
             )
 
-    print(
-        f"\nSummary: {len(results)} passed, {len(failed)} failed"
-        f", {len(skipped_broken)} broken, {len(skipped_lds)} LDS exceeded"
-    )
-
-    if results:
-        print(f"\nRepro commands (top {min(10, len(results))}):")
-        for rank, (cfg, ms, tflops, pct) in enumerate(results[:10], 1):
-            print(f"  #{rank} {cfg.label}:")
-            print(f"    {repro_cmd_fn(cfg, num_iterations)}")
+    print(f"\nSummary: {len(results)} passed, {len(failed)} failed")
 
     if failed:
-        # Categorize failures for actionable summary.
-        categories = {}
-        for cfg, err in failed:
-            first_line = err.split("\n")[0]
-            if "failed to allocate LDS" in err or "LDS" in first_line:
-                cat = "LDS_ALLOC"
-            elif (
-                "failed to run register allocator" in err
-                or "register" in first_line.lower()
-            ):
-                cat = "REGALLOC"
-            elif "compile:" in err:
-                cat = "COMPILE"
-            else:
-                cat = "RUNTIME"
-            categories.setdefault(cat, []).append((cfg, err))
+        import tempfile as _tmp
 
-        print(f"\nFailed configs ({len(failed)}):")
-        for cat, items in sorted(categories.items()):
-            print(f"\n  [{cat}] ({len(items)} configs):")
-            for cfg, err in items:
+        fd, repro_path = _tmp.mkstemp(prefix="bench_errors_", suffix=".txt", dir="/tmp")
+        with os.fdopen(fd, "w") as f:
+            for cfg, err in failed:
                 first_line = err.split("\n")[0][:200]
-                print(f"    {cfg.label}: {first_line}")
-                for extra_line in err.split("\n")[1:3]:
-                    if extra_line.strip():
-                        print(f"      {extra_line.strip()}")
-                print(f"      repro: {repro_cmd_fn(cfg, num_iterations)}")
-
-        print("\n# Add to KNOWN_BROKEN to skip these next run:")
-        for cfg, err in failed:
-            first_line = err.split("\n")[0][:80]
-            print(f'    "{cfg.label}",  # {first_line}')
+                f.write(f"{cfg.label}: {first_line}\n")
+                f.write(f"  {repro_cmd_fn(cfg, num_iterations)}\n\n")
+        print(
+            f"\n{len(failed)} compilation/occupancy/execution errors "
+            f"repros saved in {repro_path}"
+        )
 
 
 def make_inputs(cfg):
@@ -257,13 +277,12 @@ def bench_perf_sweep(
     repro_cmd_fn,
     script_path,
     top_k_to_run=None,
-    known_broken=None,
-    skip_first_n=0,
     full_sweep=False,
     num_gpus=None,
     compile_workers=None,
     num_iterations=NUM_ITERATIONS,
     post_compile_filter=None,
+    exec_sample=0,
 ):
     """Run Phase 1 (parallel compile) + Phase 2 (parallel GPU exec) sweep.
 
@@ -274,8 +293,6 @@ def bench_perf_sweep(
         repro_cmd_fn: (cfg, num_iterations) -> str for human-readable repro
         script_path: __file__ of the calling bench script (for subprocess re-entry)
         top_k_to_run: Labels to run by default (empty/None = full sweep)
-        known_broken: Labels to always skip
-        skip_first_n: Skip first N active configs
         full_sweep: Ignore top_k_to_run filter
         num_gpus: GPUs for Phase 2 (None = auto-detect)
         compile_workers: Parallel compile processes (None = default)
@@ -285,47 +302,27 @@ def bench_perf_sweep(
         num_gpus = detect_num_gpus()
     if compile_workers is None:
         compile_workers = DEFAULT_COMPILE_WORKERS
+    check_numpy_blas(num_threads=compile_workers)
     if top_k_to_run is None:
         top_k_to_run = []
-    if known_broken is None:
-        known_broken = []
 
     results = []
     failed = []
-    known_broken_set = set(known_broken)
-
-    skipped_broken = []
-    skipped_lds = []
-    active = []
-    known_broken_set = set(known_broken)
-    for c in configs:
-        if c.label in known_broken_set:
-            print(f"skip known broken config {c.label}")
-            skipped_broken.append(c)
-        elif c.lds_bytes > LDS_SIZE:
-            print(
-                f"skip config {c.label} that overflows LDS {c.lds_bytes} > {LDS_SIZE}"
-            )
-            skipped_lds.append(c)
-        else:
-            active.append(c)
+    active = list(configs)
 
     if top_k_to_run and not full_sweep:
         top_set = set(top_k_to_run)
         active = [c for c in active if c.label in top_set]
 
-    active = active[skip_first_n:]
-
     total = len(configs)
-    print(
-        f"\nRunning {len(active)}/{total} configs "
-        f"({len(skipped_broken)} broken, {len(skipped_lds)} LDS exceeded, {skip_first_n} skipped)"
-    )
+    print(f"\nRunning {len(active)}/{total} configs")
     print(f"  iterations={num_iterations}, warmup={WARMUP_ITERATIONS}")
     print(f"  compile_workers={compile_workers}, exec_gpus={num_gpus}")
     sys.stdout.flush()
 
     # -- Phase 1: Parallel compilation ---------------------------------
+    from tqdm import tqdm
+
     hsaco_dir = tempfile.mkdtemp(prefix="bench_hsaco_")
     print(
         f"\n--- Phase 1: Compiling {len(active)} configs ({compile_workers} workers) ---"
@@ -343,28 +340,25 @@ def bench_perf_sweep(
             futures[fut] = cfg
 
         total_compile = len(futures)
-        done_compile = 0
+        pbar = tqdm(total=total_compile, desc="Compiling", unit="cfg")
         for fut in as_completed(futures):
             cfg = futures[fut]
-            done_compile += 1
-            progress = f"[{done_compile}/{total_compile}]"
             try:
                 label, path, res = fut.result()
                 hsaco_paths[label] = path
                 if res:
                     resources_map[label] = res
-                print(f"  {progress} COMPILED {cfg.label}  [{res or '?'}]")
             except Exception as e:
                 err = str(e)
-                first_line = err.split("\n")[0][:200]
                 compile_failed[cfg.label] = err
                 failed.append((cfg, f"compile: {err}"))
-                print(f"  {progress} COMPILE_FAIL {cfg.label}: {first_line}")
-            sys.stdout.flush()
+            pbar.update(1)
+            pbar.set_postfix(ok=len(hsaco_paths), fail=len(compile_failed))
+        pbar.close()
 
     compiled_count = len(hsaco_paths)
     print(
-        f"\nCompilation done: {compiled_count} succeeded, "
+        f"Compilation done: {compiled_count} succeeded, "
         f"{len(compile_failed)} failed"
     )
     sys.stdout.flush()
@@ -387,24 +381,28 @@ def bench_perf_sweep(
             )
 
     # -- Phase 2: Parallel execution across GPUs -------------------------
-    exec_active = [c for c in active if c.label in hsaco_paths]
+    all_compiled = [c for c in active if c.label in hsaco_paths]
+    exec_active = all_compiled
+    if exec_sample > 0 and len(exec_active) > exec_sample:
+        import random
+
+        exec_active = random.sample(exec_active, exec_sample)
     print(
-        f"\n--- Phase 2: Executing {len(exec_active)} configs "
-        f"({num_gpus} GPU(s), subprocess-isolated) ---"
+        f"\n--- Phase 2: Executing {len(exec_active)} / {len(all_compiled)} compiled "
+        f"({num_gpus} GPU(s)) ---"
     )
     sys.stdout.flush()
 
     test_dir = os.path.join(os.path.dirname(os.path.abspath(script_path)), "..")
+    best_tflops = 0.0
+    best_pct = 0.0
+    exec_fail = 0
 
     with ThreadPoolExecutor(max_workers=num_gpus) as exec_pool:
-        future_to_info = {}
+        future_to_cfg = {}
         for i, cfg in enumerate(exec_active):
             gpu_id = i % num_gpus
             hsaco_path = hsaco_paths[cfg.label]
-            res = resources_map.get(cfg.label)
-            tag = f"[{i + 1}/{len(exec_active)}] {cfg.label}"
-            print(f"  SUBMIT {tag} -> GPU {gpu_id}  [{res or '?'}]")
-            sys.stdout.flush()
             fut = exec_pool.submit(
                 exec_one_config,
                 cfg,
@@ -415,32 +413,32 @@ def bench_perf_sweep(
                 cfg_to_cli_args,
                 script_path,
             )
-            future_to_info[fut] = (i, tag)
+            future_to_cfg[fut] = cfg
 
-        for fut in as_completed(future_to_info):
-            idx, tag = future_to_info[fut]
-            cfg, result_data, err = fut.result()
+        pbar = tqdm(total=len(exec_active), desc="Executing", unit="cfg")
+        for fut in as_completed(future_to_cfg):
+            cfg = future_to_cfg[fut]
+            cfg_ret, result_data, err = fut.result()
             if err is not None:
                 failed.append((cfg, err))
-                print(f"  FAIL  {tag}: {err.splitlines()[0]}")
-                sys.stdout.flush()
-                continue
-
-            min_ms = result_data["min_ms"]
-            tflops = result_data["tflops"]
-            pct_peak = result_data["pct_peak"]
-
-            results.append((cfg, min_ms, tflops, pct_peak))
-            print(
-                f"  OK    {tag}: {min_ms:.2f} ms  {tflops:.1f} TFLOPS  ({pct_peak:.1f}%)"
+                exec_fail += 1
+            else:
+                min_ms = result_data["min_ms"]
+                tflops = result_data["tflops"]
+                pct_peak = result_data["pct_peak"]
+                results.append((cfg, min_ms, tflops, pct_peak))
+                if tflops > best_tflops:
+                    best_tflops = tflops
+                    best_pct = pct_peak
+            pbar.update(1)
+            pbar.set_postfix_str(
+                f"best {best_tflops:.1f} TF ({best_pct:.1f}% peak), fail={exec_fail}"
             )
-            sys.stdout.flush()
+        pbar.close()
 
     print_summary_table(
         results,
         failed,
-        skipped_broken,
-        skipped_lds,
         resources_map,
         repro_cmd_fn,
         num_iterations,
@@ -474,17 +472,34 @@ def run_single(cfg, compile_fn, args, execute_fn):
 
     Emits BENCH_RESULT_JSON for sweep parsing.
     """
-    from aster.hip import parse_asm_kernel_resources
+    from aster.hip import parse_asm_kernel_resources, compute_register_budget
 
     kname = cfg.kernel_name
     print_ir = getattr(args, "print_ir_after_all", False)
     print_asm = getattr(args, "print_asm", False)
 
+    # Compute register budget from occupancy target.
+    num_wg_per_cu = getattr(args, "num_wg_per_cu", 1) or 1
+    mcpu = getattr(cfg, "mcpu", "gfx942")
+    budget_vgprs, budget_agprs, _lds = compute_register_budget(
+        cfg.num_threads, mcpu=mcpu, num_wg_per_cu=num_wg_per_cu
+    )
+    num_vgprs = getattr(args, "num_vgprs", None) or budget_vgprs
+    num_agprs = getattr(args, "num_agprs", None) or budget_agprs
+
+    compile_kwargs = dict(
+        print_ir_after_all=print_ir, num_vgprs=num_vgprs, num_agprs=num_agprs
+    )
+    print(
+        f"  register budget: vgpr={num_vgprs}, agpr={num_agprs}"
+        f" (wg_per_cu={num_wg_per_cu})"
+    )
+
     if args.compile_only:
         if not args.hsaco:
             print("Error: --compile-only requires --hsaco <output_path>")
             raise SystemExit(1)
-        _, asm = compile_fn(cfg, args.hsaco, print_ir_after_all=print_ir)
+        _, asm = compile_fn(cfg, args.hsaco, **compile_kwargs)
         resources = parse_asm_kernel_resources(asm, kernel_name=kname)
         res = resources.get(kname)
         print_config(cfg, args.iterations, res)
@@ -518,7 +533,7 @@ def run_single(cfg, compile_fn, args, execute_fn):
         import tempfile as _tempfile
 
         with _tempfile.NamedTemporaryFile(suffix=".hsaco", delete=True) as tmp:
-            _, asm = compile_fn(cfg, tmp.name, print_ir_after_all=print_ir)
+            _, asm = compile_fn(cfg, tmp.name, **compile_kwargs)
             resources = parse_asm_kernel_resources(asm, kernel_name=kname)
             res = resources.get(kname)
             print_config(cfg, args.iterations, res)
@@ -568,6 +583,18 @@ def add_sweep_cli_args(parser, default_compile_workers=DEFAULT_COMPILE_WORKERS):
         help="Run all configs in the sweep grid (implies --sweep)",
     )
     parser.add_argument(
+        "--compile-sample",
+        type=int,
+        default=4096,
+        help="Random sample of configs to compile (0 = all, default: 4096)",
+    )
+    parser.add_argument(
+        "--exec-sample",
+        type=int,
+        default=2048,
+        help="Random sample of compiled configs to execute (0 = all, default: 2048)",
+    )
+    parser.add_argument(
         "--num-gpus",
         type=int,
         default=None,
@@ -578,6 +605,11 @@ def add_sweep_cli_args(parser, default_compile_workers=DEFAULT_COMPILE_WORKERS):
         type=int,
         default=default_compile_workers,
         help=f"Parallel compilation processes (default: {default_compile_workers})",
+    )
+    parser.add_argument(
+        "--no-reg-filter",
+        action="store_true",
+        help="Disable pre-compile register estimate filter (may cause many regalloc failures)",
     )
 
 
@@ -614,4 +646,22 @@ def add_single_cli_args(parser, num_iterations=NUM_ITERATIONS):
         "--force",
         action="store_true",
         help="Run despite occupancy violations (use to confirm HIP will crash)",
+    )
+    parser.add_argument(
+        "--num-vgprs",
+        type=int,
+        default=None,
+        help="Max VGPRs for register allocation (default: computed from occupancy)",
+    )
+    parser.add_argument(
+        "--num-agprs",
+        type=int,
+        default=None,
+        help="Max AGPRs for register allocation (default: computed from occupancy)",
+    )
+    parser.add_argument(
+        "--num-wg-per-cu",
+        type=int,
+        default=1,
+        help="Target workgroups per CU for register/LDS budget (default: 1)",
     )
