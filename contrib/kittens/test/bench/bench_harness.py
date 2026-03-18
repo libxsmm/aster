@@ -7,6 +7,7 @@ Phase 3: Correctness verification (ProcessPoolExecutor).
 
 import json
 import os
+import signal
 import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -21,6 +22,7 @@ MI300X_PEAK_TFLOPS_F16 = 1307.0
 NUM_ITERATIONS = 5
 WARMUP_ITERATIONS = 2
 DEFAULT_COMPILE_WORKERS = 8
+DEFAULT_COMPILE_TIMEOUT = 60  # seconds per kernel
 
 
 # -- Helpers ---------------------------------------------------------------
@@ -79,28 +81,108 @@ def format_mlir_error_oneline(e):
     return first[:200] if first else type(e).__name__
 
 
-# -- Compilation (subprocess) ----------------------------------------------
+# -- Compilation (subprocess, crash-isolated) ------------------------------
 
 
-def compile_one(cfg, hsaco_dir, compile_fn):
-    """Compile one config to HSACO (called in worker process)."""
-    from aster.hip import parse_asm_kernel_resources, compute_register_budget
+def _compile_inner(cfg, hsaco_dir, compile_fn, result_pipe, stderr_path):
+    """Run compilation in an isolated child process. Sends result via pipe.
 
-    output = os.path.join(hsaco_dir, f"{cfg.label}.hsaco")
-    wg = getattr(cfg, "num_wg_per_cu", 1) or 1
-    bv, ba, _ = compute_register_budget(
-        cfg.num_threads, mcpu=getattr(cfg, "mcpu", "gfx942"), num_wg_per_cu=wg
-    )
+    If this process crashes (segfault, assertion), the parent reads stderr_path to
+    capture the error spew. stderr is redirected to a file so it survives crashes (pipes
+    would lose buffered data on SIGKILL/SIGSEGV).
+    """
+    # Redirect stderr to file so crash output is preserved.
+    stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.dup2(stderr_fd, 2)
+    os.close(stderr_fd)
+
     try:
+        from aster.hip import parse_asm_kernel_resources, compute_register_budget
+
+        output = os.path.join(hsaco_dir, f"{cfg.label}.hsaco")
+        wg = getattr(cfg, "num_wg_per_cu", 1) or 1
+        bv, ba, _ = compute_register_budget(
+            cfg.num_threads, mcpu=getattr(cfg, "mcpu", "gfx942"), num_wg_per_cu=wg
+        )
         _, asm = compile_fn(cfg, output, num_vgprs=bv, num_agprs=ba)
+        with open(output.replace(".hsaco", ".s"), "w") as f:
+            f.write(asm)
+        res = parse_asm_kernel_resources(asm, kernel_name=cfg.kernel_name).get(
+            cfg.kernel_name
+        )
+        result_pipe.send(("ok", (cfg.label, output, res)))
     except Exception as e:
-        raise RuntimeError(format_mlir_error_oneline(e)) from None
-    with open(output.replace(".hsaco", ".s"), "w") as f:
-        f.write(asm)
-    res = parse_asm_kernel_resources(asm, kernel_name=cfg.kernel_name).get(
-        cfg.kernel_name
+        result_pipe.send(("error", format_mlir_error_oneline(e)))
+    finally:
+        result_pipe.close()
+
+
+def _read_stderr_log(path, max_bytes=4096):
+    """Read the tail of a stderr log file, return as string."""
+    try:
+        size = os.path.getsize(path)
+        with open(path) as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # skip partial line
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def compile_one(cfg, hsaco_dir, compile_fn, timeout=DEFAULT_COMPILE_TIMEOUT):
+    """Compile one config to HSACO in a crash-isolated subprocess.
+
+    Spawns a child process for the actual compilation. If it crashes (segfault,
+    assertion) or exceeds the timeout, the pool worker stays alive and reports the
+    failure. Crash stderr is captured to a log file in hsaco_dir.
+    """
+    import multiprocessing as mp
+
+    stderr_path = os.path.join(hsaco_dir, f"{cfg.label}.stderr")
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    p = mp.Process(
+        target=_compile_inner,
+        args=(cfg, hsaco_dir, compile_fn, child_conn, stderr_path),
     )
-    return cfg.label, output, res
+    p.start()
+    child_conn.close()
+
+    p.join(timeout=timeout)
+    if p.is_alive():
+        p.kill()
+        p.join()
+        parent_conn.close()
+        stderr = _read_stderr_log(stderr_path)
+        msg = f"compilation timed out after {timeout}s"
+        if stderr:
+            msg += f"\n{stderr}"
+        raise TimeoutError(msg)
+
+    if p.exitcode != 0:
+        parent_conn.close()
+        stderr = _read_stderr_log(stderr_path)
+        sig = -p.exitcode if p.exitcode < 0 else p.exitcode
+        msg = f"crash (signal {sig})" if p.exitcode < 0 else f"crash (exit {sig})"
+        if stderr:
+            msg += f"\n{stderr}"
+        raise RuntimeError(msg)
+
+    # Clean up stderr log on success.
+    try:
+        os.unlink(stderr_path)
+    except OSError:
+        pass
+
+    if not parent_conn.poll():
+        parent_conn.close()
+        raise RuntimeError("compilation produced no result")
+
+    status, payload = parent_conn.recv()
+    parent_conn.close()
+    if status == "error":
+        raise RuntimeError(payload)
+    return payload
 
 
 # -- GPU execution (subprocess, crash-isolated) ----------------------------
@@ -347,6 +429,7 @@ def bench_perf_sweep(
     full_sweep=False,
     num_gpus=None,
     compile_workers=None,
+    compile_timeout=DEFAULT_COMPILE_TIMEOUT,
     num_iterations=NUM_ITERATIONS,
     post_compile_filter=None,
     exec_sample=0,
@@ -377,7 +460,10 @@ def bench_perf_sweep(
     hsaco_dir = tempfile.mkdtemp(prefix="bench_hsaco_")
     hsaco_paths, resources_map, failed = {}, {}, []
     with ProcessPoolExecutor(max_workers=compile_workers) as pool:
-        futs = {pool.submit(compile_one, c, hsaco_dir, compile_fn): c for c in active}
+        futs = {
+            pool.submit(compile_one, c, hsaco_dir, compile_fn, compile_timeout): c
+            for c in active
+        }
         pbar = tqdm(total=len(futs), desc="Compiling", unit="cfg")
         for fut in as_completed(futs):
             cfg = futs[fut]
@@ -387,10 +473,11 @@ def bench_perf_sweep(
                 if res:
                     resources_map[label] = res
             except Exception as e:
-                err_line = str(e).split("\n")[0].strip()[:200]
-                if not err_line:
-                    err_line = type(e).__name__
-                failed.append((cfg, f"compile: {err_line}"))
+                full_err = str(e).strip()
+                short = full_err.split("\n")[0].strip()[:200]
+                if not short:
+                    short = type(e).__name__
+                failed.append((cfg, f"compile: {short}", full_err))
             pbar.update(1)
             pbar.set_postfix(ok=len(hsaco_paths), fail=len(failed))
         pbar.close()
@@ -422,12 +509,12 @@ def bench_perf_sweep(
         num_gpus,
         desc="Executing",
     )
-    failed.extend(exec_failed)
+    failed.extend((c, e, "") for c, e in exec_failed)
 
     # Summary: separate files for compile errors vs exec errors.
     results.sort(key=lambda r: r[2], reverse=True)
-    compile_errs = [(c, e) for c, e in failed if e.startswith("compile:")]
-    exec_errs = [(c, e) for c, e in failed if not e.startswith("compile:")]
+    compile_errs = [(c, e, full) for c, e, full in failed if e.startswith("compile:")]
+    exec_errs = [(c, e, full) for c, e, full in failed if not e.startswith("compile:")]
     saved_files = []
 
     if results:
@@ -441,7 +528,7 @@ def bench_perf_sweep(
     if compile_errs:
         from collections import Counter
 
-        err_counts = Counter(e for _, e in compile_errs)
+        err_counts = Counter(e for _, e, _ in compile_errs)
         header = [
             f"# {len(compile_errs)} compile failures, {len(err_counts)} unique errors",
             "#",
@@ -450,7 +537,7 @@ def bench_perf_sweep(
             header.append(f"# {cnt:>5}x {msg}")
         header.append("#")
         detail = []
-        for c, e in compile_errs:
+        for c, e, full in compile_errs:
             repro = ""
             if repro_cmd_fn:
                 try:
@@ -458,13 +545,16 @@ def bench_perf_sweep(
                 except Exception:
                     pass
             detail.append(f"{c.label}: {e}{repro}")
+            if full and full != e.removeprefix("compile: "):
+                for line in full.split("\n"):
+                    detail.append(f"  {line}")
         p = _save_tmpfile("bench_compile_errors_", header + detail)
         saved_files.append(p)
         print(f"{len(compile_errs)} compile errors in {p}")
     if exec_errs:
         from collections import Counter
 
-        exec_counts = Counter(e for _, e in exec_errs)
+        exec_counts = Counter(e for _, e, _ in exec_errs)
         header = [
             f"# {len(exec_errs)} exec failures, {len(exec_counts)} unique errors",
             "#",
@@ -472,7 +562,7 @@ def bench_perf_sweep(
         for msg, cnt in exec_counts.most_common(10):
             header.append(f"# {cnt:>5}x {msg}")
         header.append("#")
-        detail = [f"{c.label}: {e}" for c, e in exec_errs]
+        detail = [f"{c.label}: {e}" for c, e, _ in exec_errs]
         p = _save_tmpfile("bench_exec_errors_", header + detail)
         saved_files.append(p)
         print(f"{len(exec_errs)} exec errors in {p}")
@@ -594,6 +684,12 @@ def add_sweep_cli_args(parser):
     a("--exec-sample", type=int, default=2048, help="Configs to execute (0=all)")
     a("--num-gpus", type=int, default=None, help="GPUs (default: auto)")
     a("--compile-workers", type=int, default=DEFAULT_COMPILE_WORKERS)
+    a(
+        "--compile-timeout",
+        type=int,
+        default=DEFAULT_COMPILE_TIMEOUT,
+        help=f"Per-kernel compile timeout in seconds (default: {DEFAULT_COMPILE_TIMEOUT})",
+    )
     a("--no-reg-filter", action="store_true", help="Disable register estimate filter")
 
 
