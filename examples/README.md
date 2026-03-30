@@ -26,9 +26,9 @@ uv pip install -r requirements-amd-gfx94X.txt --prerelease=allow
 python examples/01_hello_asm/run.py
 ```
 
-**4. (Optional) Install [rocprof-compute-viewer](https://github.com/ROCm/rocprof-compute-viewer/) for trace visualization.**
+**(Optional) Install [rocprof-compute-viewer](https://github.com/ROCm/rocprof-compute-viewer/) for trace visualization.**
 Download a pre-built binary from the [releases page](https://github.com/ROCm/rocprof-compute-viewer/releases),
-or build from source (requires Qt 6).
+or build it from source following the instructions on the repo.
 
 ## Running
 
