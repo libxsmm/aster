@@ -1,0 +1,31 @@
+name: Aster Intel AMX
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+env:
+  NPROCS_LIMIT_LINK: 8
+  SRUN: ${HOME}/srun.sh
+
+jobs:
+  AMX_Examples:
+    runs-on: pcl-tiergarten
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build LLVM
+        run: |
+          bash tools/pkgs/llvm/build.sh --output=${{ github.workspace }}/build/llvm
+
+      - name: Build the project
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DASTER_ENABLE_CPU=ON \
+                -DLLVM_DIR=${{ github.workspace }}/build/llvm
+          cmake --build build --target install -j $(nproc)
+
+      - name: Run AMX matmul example
+        run: |
+          ${{ env.SRUN }} --partition=emr --time=0:30:00 -- \
+          cmake --build build --target check-aster-amx -j $(nproc)
